@@ -9,6 +9,53 @@ implementation of the Cap'n Proto remote procedure call protocol.
 It is a fairly direct translation of the original
 [C++ implementation](https://github.com/sandstorm-io/capnproto).
 
+## Unix file descriptors
+
+Enable the optional `tokio-unix` feature to pass file descriptors over Tokio
+Unix sockets using `SCM_RIGHTS` and the standard RPC `CapDescriptor.attachedFd`
+field:
+
+```rust,ignore
+let network = capnp_rpc::twoparty::VatNetwork::new_unix(
+    socket,
+    capnp_rpc::rpc_twoparty_capnp::Side::Client,
+    Default::default(),
+    8, // Maximum descriptors to receive per message; zero disables reception.
+);
+let client: my_capnp::buffer::Client =
+    capnp_rpc::new_client_with_fd(BufferServer { /* ... */ }, owned_fd);
+
+// On the receiving side, wait for a promised capability to resolve if necessary.
+if let Some(fd) = capnp_rpc::get_fd(&client).await? {
+    let independently_owned_fd = fd.try_clone()?;
+}
+```
+
+Descriptors are attached to capabilities, not integer fields in application
+schemas. Their meaning is defined by your application. They are shared through
+`Rc<OwnedFd>` and automatically closed when no longer referenced. Sending a
+capability back to its original owner preserves its identity; forwarding it over
+another FD-aware connection also forwards its descriptor. Promised capabilities
+receive their descriptors when resolved.
+
+FD passing is an optional optimization: ordinary stream transports continue to
+work unchanged and omit descriptors. Receivers also discard descriptors beyond
+their configured limit (never more than 253 per message). Always handle
+`get_fd()` returning `None`, preferably by providing equivalent RPC methods.
+Only pass descriptors to trusted peers: they grant direct OS-level access which
+cannot be revoked by dropping an RPC capability. Received descriptors have
+close-on-exec set; on platforms other than Linux/Android this is not atomic with
+receipt, so concurrent fork/exec must be synchronized by the application.
+Do not access or buffer the socket outside the FD-aware transport.
+
+The [Linux memfd example](examples/fd-passing) sends a sealed memory-backed file
+and provides an RPC read fallback:
+
+```sh
+cargo run -p fd-passing
+cargo test -p fd-passing
+```
+
 ## Defining an interface
 
 First, make sure that the

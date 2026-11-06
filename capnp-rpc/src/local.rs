@@ -351,6 +351,8 @@ where
     S: capability::Server + Clone,
 {
     inner: S,
+    #[cfg(unix)]
+    fd: Option<Rc<std::os::fd::OwnedFd>>,
 
     /// If a streaming call on this capability has returned an error,
     /// this contains a copy of that error.
@@ -533,11 +535,20 @@ where
         Self {
             state: Rc::new(RefCell::new(ClientState {
                 inner: server,
+                #[cfg(unix)]
+                fd: None,
                 broken_error: None,
                 blocked: false,
                 blocked_calls: VecDeque::new(),
             })),
         }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn new_with_fd(server: S, fd: std::os::fd::OwnedFd) -> Self {
+        let client = Self::new(server);
+        client.state.borrow_mut().fd = Some(Rc::new(fd));
+        client
     }
 }
 
@@ -556,6 +567,11 @@ impl<S> ClientHook for Client<S>
 where
     S: capability::Server + Clone + 'static,
 {
+    #[cfg(unix)]
+    fn get_fd(&self) -> Option<Rc<std::os::fd::OwnedFd>> {
+        self.state.borrow().fd.clone()
+    }
+
     fn add_ref(&self) -> Box<dyn ClientHook> {
         Box::new(self.clone())
     }

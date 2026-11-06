@@ -113,6 +113,12 @@ use capnp::message;
 
 /// A message to be sent by a [`VatNetwork`].
 pub trait OutgoingMessage {
+    /// Attaches descriptors in the order used by `CapDescriptor.attachedFd`.
+    ///
+    /// Transports without FD passing discard them, as permitted by the RPC protocol.
+    #[cfg(unix)]
+    fn set_fds(&mut self, _fds: Vec<Rc<std::os::fd::OwnedFd>>) {}
+
     /// Gets the message body, which the caller may fill in any way it wants.
     ///
     /// The standard RPC implementation initializes it as a Message as defined
@@ -143,6 +149,14 @@ pub trait OutgoingMessage {
 
 /// A message received from a [`VatNetwork`].
 pub trait IncomingMessage {
+    /// Takes an attached descriptor. Each index can be taken at most once.
+    ///
+    /// Missing and out-of-range indices mean that no descriptor was attached.
+    #[cfg(unix)]
+    fn take_fd(&self, _index: usize) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
+
     /// Gets the message body, to be interpreted by the caller.
     ///
     /// The standard RPC implementation interprets it as a Message as defined
@@ -392,6 +406,48 @@ where
     capnp::capability::FromClientHook::new(Box::new(local::Client::new(
         <C as capnp::capability::FromServer<S>>::from_server(s),
     )))
+}
+
+/// Creates a local capability with an attached Unix file descriptor.
+///
+/// The descriptor is shared by clones of the capability and stays open while
+/// either the capability or a reference returned by [`get_fd`] exists.
+/// Sending it over a transport without FD passing still sends the capability.
+#[cfg(unix)]
+pub fn new_client_with_fd<C, S>(s: S, fd: std::os::fd::OwnedFd) -> C
+where
+    C: capnp::capability::FromServer<S>,
+{
+    capnp::capability::FromClientHook::new(Box::new(local::Client::new_with_fd(
+        <C as capnp::capability::FromServer<S>>::from_server(Rc::new(s)),
+        fd,
+    )))
+}
+
+/// Obtains a capability's attached descriptor, waiting for resolution if needed.
+///
+/// `None` means FD passing was unavailable or no descriptor was attached.
+/// Use `try_clone()` on the returned owner to obtain an independently owned FD.
+#[cfg(unix)]
+pub fn get_fd<C: capnp::capability::FromClientHook>(
+    client: &C,
+) -> Promise<Option<Rc<std::os::fd::OwnedFd>>, Error> {
+    let mut hook = client.as_client_hook().add_ref();
+    Promise::from_future(async move {
+        loop {
+            if let Some(fd) = hook.get_fd() {
+                return Ok(Some(fd));
+            }
+            if let Some(resolved) = hook.get_resolved() {
+                hook = resolved;
+                continue;
+            }
+            match hook.when_more_resolved() {
+                Some(resolution) => hook = resolution.await?,
+                None => return Ok(None),
+            }
+        }
+    })
 }
 
 /// Creates a "broken" capability that returns the given error from every operation.

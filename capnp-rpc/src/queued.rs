@@ -249,6 +249,15 @@ impl Client {
 }
 
 impl ClientHook for Client {
+    #[cfg(unix)]
+    fn get_fd(&self) -> Option<Rc<std::os::fd::OwnedFd>> {
+        self.inner
+            .borrow()
+            .redirect
+            .as_ref()
+            .and_then(|c| c.get_fd())
+    }
+
     fn add_ref(&self) -> Box<dyn ClientHook> {
         Box::new(Self {
             inner: self.inner.clone(),

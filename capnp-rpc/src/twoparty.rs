@@ -30,19 +30,33 @@ use futures::{AsyncRead, AsyncWrite, FutureExt, TryFutureExt};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
+#[cfg(all(unix, feature = "tokio-unix"))]
+pub mod unix;
+
 pub type VatId = crate::rpc_twoparty_capnp::Side;
 
 struct IncomingMessage {
     message: ::capnp::message::Reader<capnp::serialize::OwnedSegments>,
+    #[cfg(unix)]
+    fds: RefCell<Vec<Option<std::os::fd::OwnedFd>>>,
 }
 
 impl IncomingMessage {
     pub(crate) fn new(message: ::capnp::message::Reader<capnp::serialize::OwnedSegments>) -> Self {
-        Self { message }
+        Self {
+            message,
+            #[cfg(unix)]
+            fds: RefCell::new(Vec::new()),
+        }
     }
 }
 
 impl crate::IncomingMessage for IncomingMessage {
+    #[cfg(unix)]
+    fn take_fd(&self, index: usize) -> Option<std::os::fd::OwnedFd> {
+        self.fds.borrow_mut().get_mut(index).and_then(Option::take)
+    }
+
     fn get_body(&self) -> ::capnp::Result<::capnp::any_pointer::Reader<'_>> {
         self.message.get_root()
     }
@@ -50,10 +64,34 @@ impl crate::IncomingMessage for IncomingMessage {
 
 struct OutgoingMessage {
     message: ::capnp::message::Builder<::capnp::message::HeapAllocator>,
-    sender: ::capnp_futures::Sender<Rc<::capnp::message::Builder<::capnp::message::HeapAllocator>>>,
+    sender: Sender,
+    #[cfg(unix)]
+    fds: Vec<Rc<std::os::fd::OwnedFd>>,
+}
+
+#[derive(Clone)]
+enum Sender {
+    Stream(capnp_futures::Sender<Rc<capnp::message::Builder<capnp::message::HeapAllocator>>>),
+    #[cfg(all(unix, feature = "tokio-unix"))]
+    Unix(unix::Sender),
+}
+
+impl Sender {
+    fn terminate(&mut self, result: capnp::Result<()>) -> Promise<(), capnp::Error> {
+        match self {
+            Self::Stream(sender) => Promise::from_future(sender.terminate(result)),
+            #[cfg(all(unix, feature = "tokio-unix"))]
+            Self::Unix(sender) => sender.terminate(result),
+        }
+    }
 }
 
 impl crate::OutgoingMessage for OutgoingMessage {
+    #[cfg(unix)]
+    fn set_fds(&mut self, fds: Vec<Rc<std::os::fd::OwnedFd>>) {
+        self.fds = fds;
+    }
+
     fn get_body(&mut self) -> ::capnp::Result<::capnp::any_pointer::Builder<'_>> {
         self.message.get_root()
     }
@@ -72,12 +110,16 @@ impl crate::OutgoingMessage for OutgoingMessage {
         let Self {
             message,
             mut sender,
+            #[cfg(unix)]
+                fds: _fds,
         } = tmp;
         let m = Rc::new(message);
-        (
-            Promise::from_future(sender.send(m.clone()).map_ok(|_| ())),
-            m,
-        )
+        let promise = match &mut sender {
+            Sender::Stream(sender) => Promise::from_future(sender.send(m.clone()).map_ok(|_| ())),
+            #[cfg(all(unix, feature = "tokio-unix"))]
+            Sender::Unix(sender) => sender.send(m.clone(), _fds),
+        };
+        (promise, m)
     }
 
     fn take(self: Box<Self>) -> ::capnp::message::Builder<::capnp::message::HeapAllocator> {
@@ -94,7 +136,9 @@ where
     T: AsyncRead + 'static,
 {
     input_stream: Rc<RefCell<Option<T>>>,
-    sender: ::capnp_futures::Sender<Rc<::capnp::message::Builder<::capnp::message::HeapAllocator>>>,
+    sender: Sender,
+    #[cfg(all(unix, feature = "tokio-unix"))]
+    incoming_fds: Option<Rc<RefCell<Vec<std::os::fd::OwnedFd>>>>,
     side: crate::rpc_twoparty_capnp::Side,
     receive_options: ReaderOptions,
     on_disconnect_fulfiller: Option<oneshot::Sender<()>>,
@@ -128,9 +172,7 @@ where
 {
     fn new(
         input_stream: T,
-        sender: ::capnp_futures::Sender<
-            Rc<::capnp::message::Builder<::capnp::message::HeapAllocator>>,
-        >,
+        sender: Sender,
         side: crate::rpc_twoparty_capnp::Side,
         receive_options: ReaderOptions,
         on_disconnect_fulfiller: oneshot::Sender<()>,
@@ -139,6 +181,8 @@ where
             inner: Rc::new(RefCell::new(ConnectionInner {
                 input_stream: Rc::new(RefCell::new(Some(input_stream))),
                 sender,
+                #[cfg(all(unix, feature = "tokio-unix"))]
+                incoming_fds: None,
                 side,
                 receive_options,
                 on_disconnect_fulfiller: Some(on_disconnect_fulfiller),
@@ -166,6 +210,8 @@ where
         Box::new(OutgoingMessage {
             message,
             sender: self.inner.borrow().sender.clone(),
+            #[cfg(unix)]
+            fds: Vec::new(),
         })
     }
 
@@ -179,13 +225,21 @@ where
         match maybe_input_stream {
             Some(mut s) => {
                 let receive_options = inner.receive_options;
+                #[cfg(all(unix, feature = "tokio-unix"))]
+                let incoming_fds = inner.incoming_fds.clone();
                 Promise::from_future(async move {
                     let maybe_message =
                         ::capnp_futures::serialize::try_read_message(&mut s, receive_options)
                             .await?;
                     *return_it_here.borrow_mut() = Some(s);
                     Ok(maybe_message.map(|message| {
-                        Box::new(IncomingMessage::new(message)) as Box<dyn crate::IncomingMessage>
+                        let incoming = IncomingMessage::new(message);
+                        #[cfg(all(unix, feature = "tokio-unix"))]
+                        if let Some(fds) = incoming_fds {
+                            *incoming.fds.borrow_mut() =
+                                fds.borrow_mut().drain(..).map(Some).collect();
+                        }
+                        Box::new(incoming) as Box<dyn crate::IncomingMessage>
                     }))
                 })
             }
@@ -206,7 +260,7 @@ where
     }
 
     fn shutdown(&mut self, result: ::capnp::Result<()>) -> Promise<(), ::capnp::Error> {
-        Promise::from_future(self.inner.borrow_mut().sender.terminate(result))
+        self.inner.borrow_mut().sender.terminate(result)
     }
 }
 
@@ -249,24 +303,36 @@ where
     where
         U: AsyncWrite + 'static + Unpin,
     {
+        let (sender, write_queue) = capnp_futures::write_queue(output_stream);
+        Self::new_internal(
+            input_stream,
+            Sender::Stream(sender),
+            write_queue,
+            side,
+            receive_options,
+        )
+    }
+
+    fn new_internal(
+        input_stream: T,
+        sender: Sender,
+        write_queue: impl std::future::Future<Output = capnp::Result<()>> + 'static,
+        side: crate::rpc_twoparty_capnp::Side,
+        receive_options: ReaderOptions,
+    ) -> Self {
         let (fulfiller, disconnect_promise) = oneshot::channel();
         let disconnect_promise =
             disconnect_promise.map_err(|_| ::capnp::Error::disconnected("disconnected".into()));
 
-        let (execution_driver, sender) = {
-            let (tx, write_queue) = ::capnp_futures::write_queue(output_stream);
-
+        let execution_driver = {
             // Don't use `.join()` here because we need to make sure to wait for `disconnect_promise` to
             // resolve even if `write_queue` resolves to an error.
-            (
-                Promise::from_future(write_queue.then(move |r| {
-                    disconnect_promise
-                        .then(move |_| futures::future::ready(r))
-                        .map_ok(|_| ())
-                }))
-                .shared(),
-                tx,
-            )
+            Promise::from_future(write_queue.then(move |r| {
+                disconnect_promise
+                    .then(move |_| futures::future::ready(r))
+                    .map_ok(|_| ())
+            }))
+            .shared()
         };
 
         let connection = Connection::new(input_stream, sender, side, receive_options, fulfiller);

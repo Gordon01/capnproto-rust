@@ -44,6 +44,14 @@ pub trait RequestHook {
 }
 
 pub trait ClientHook {
+    /// Returns the descriptor attached to this capability, if available.
+    ///
+    /// The reference-counted owner keeps it open independently of the capability.
+    #[cfg(all(unix, feature = "std"))]
+    fn get_fd(&self) -> Option<alloc::rc::Rc<std::os::fd::OwnedFd>> {
+        None
+    }
+
     fn add_ref(&self) -> alloc::boxed::Box<dyn ClientHook>;
     fn new_call(
         &self,

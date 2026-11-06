@@ -27,6 +27,7 @@ members = [
     "capnp-rpc/examples/shared-secret-capability",
     "capnp-rpc/examples/streaming",
     "capnp-rpc/examples/reconnect",
+    "capnp-rpc/examples/fd-passing",
     "capnp-rpc/test",
     "example/addressbook",
     "example/addressbook_send",

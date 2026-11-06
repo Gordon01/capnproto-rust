@@ -1,0 +1,22 @@
+[package]
+name = "fd-passing"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "fd-passing"
+path = "main.rs"
+
+[build-dependencies]
+capnpc = { path = "../../../capnpc" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+capnp = { path = "../../../capnp" }
+capnp-rpc = { path = "../..", features = ["tokio-unix"] }
+futures = "0.3"
+rustix = { version = "1", features = ["fs"] }
+tokio = { version = "1", features = ["net", "rt", "time"] }
+
+[lints]
+workspace = true
